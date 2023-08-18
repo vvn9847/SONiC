@@ -245,7 +245,7 @@ for i = 1, n do
 end
 return ret
 ```
-Removing the *DEL* and *HSET* operations can significantly improve redis performance. We have observed 200% speed improvement in single *Table->pops()* function call, 10% speed improvement in transferring routes through APPL_DB between fpmsyncd and orchagent.
+Removing the *DEL* and *HSET* operations can significantly improve redis performance. We have observed nearly 100% speed improvement in *Table->pops()* function call, 10% speed improvement in transferring routes through APPL_DB between fpmsyncd and orchagent.
 
 **NOTE:** The original lua script works fine for other modules, we can add a new ```pops()``` function for routeorch using the new lua script. 
 
