@@ -151,6 +151,9 @@ The figure below shows the high level architecture of software pipeline enhancem
 <img src="img/pipeline-mode.png" alt="Figure 5. Pipeline architecture comparing to original architecture" width="80%" height="auto">
 </p>
 
+- Add flush_timer in fpmsyncd to flush routes in bigger size.
+- Add pipeline architecture in Orchagent and Syncd to process route in parallel.
+- Use ring buffer to deliver message between threads. Ring buffer is better than mutex buffer in performance, since switching between kernel state and user state is not needed.
 <!-- omit in toc -->
 ##### Figure 6. Pipeline timeline
 The figure below shows the high level architecture of software pipeline enhancement.
@@ -167,7 +170,7 @@ Using pipeline inside orchagent and syncd can theoretically double the routing l
 ### 6.1. Fpmsyncd
 Fpmsyncd needs a timer thread to flush pipeline. *FLUSH_INTERVAL* controls the interval between two flush operations. An appropriate *FLUSH_INTERVAL* should be set to ensure route is buffered in redis pipeline and is not delayed for too long. The original flush operations in the main loop may not be needed any more. Since timer thread and main thread both operate on the same redis pipeline object, a mutex lock is needed here. 
 
-Since data are now buffered in redis pipeline, we need to set a larger size for redis pipeline rather than 128 as default value. Redis pipeline will flush itself when it's full, so a larger size may also reduce redis I/O pressure. *10000* to *15000* seems to be an appropriate size in our use case. 
+Since data are now buffered in redis pipeline, we need to set a larger size for redis pipeline rather than 128 as default value. Redis pipeline will flush itself when it's full, so a larger size may also reduce redis I/O pressure. *10000* to *15000* is an appropriate size range in our use case. 
 
 *FLUSH_INTERVAL* and *REDIS_PIPELINE_SIZE* should be configured by user for different use case.
 
@@ -186,28 +189,32 @@ A new Consumer class is defined to work in pipeline architecture.
 ```c++
 class Consumer_pipeline : public Consumer {
   public:
-    /*
-    Table->pops() should be in execute(). 
-    Called by master thread to maintain time sequence.
-    */
+    /**
+     * Table->pops() should be in execute(). 
+     * Called by master thread to maintain time sequence.
+     */
     void execute() override;  
-    /*
-    Main function for the new thread.
-    */
+    /**
+     * Main function for the new thread.
+     */
     void drain() override;    
-    /*
-    Need modified to support warm restart
-    */
+    /**
+     * Need modified to support warm restart
+     */
     void dumpPendingTasks(std::vector<std::string> &ts) override;
-    /*
-    dump task to ringbuffer and load task from ring buffer
-    */
+    /**
+     * Dump task to ringbuffer and load task from ring buffer
+     */
     void dumptask(std::deque<swss::KeyOpFieldsValuesTuple> &entries);
     void loadtask(std::deque<swss::KeyOpFieldsValuesTuple> &entries);
   private:
-    /*use ring buffer to deliver/buffer data*/
+    /**
+     * Use ring buffer to deliver/buffer data
+     */
     RingBuffer<swss::KeyOpFieldsValuesTuple> task_RingBuffer;
-    /*New thread for drain*/
+    /**
+     * New thread for drain
+     */
     std::thread m_thread_drain;
 }
 ```
@@ -263,7 +270,7 @@ We have already observed bottleneck in *libsai*. Since it varies depending on th
 ### 9.1 System test
 - All modules should maintain the time sequence of route loading.
 - All modules should support WarmRestart.
-- No routes should stay in redis pipeline longer than configured interval.
+- No routes should remain in redis pipeline longer than configured interval.
 - No data should remain in ring buffer when system finishes routing loading.
 - System should be able to install/remove/set routes (faster than before).
 
