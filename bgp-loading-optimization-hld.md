@@ -1,5 +1,5 @@
 <!-- omit in toc -->
-# SONiC BGP Loading Time Enhancement
+# BGP Routes Loading Optimization for SONiC
 
 <!-- omit in toc -->
 ### Revision
@@ -145,19 +145,21 @@ The main performance bottleneck here lies in the linearity of the 3 tasks.
 There is much Redis I/O traffic during the BGP loading process, from which we find two sources of unnecessary traffic.
 
 #### fpmsyncd flushes on every data arrival
-In the original design, `fpmsyncd` maintains a variable `pipeline`. Each time `fpmsyncd` receives routes from zebra, it put the processed routes in the `pipeline`, and flushes the pipeline to `APPL_DB` to make sure no data get stuck in the pipeline, and then publishs the updates, which triggers the subscribers to do Redis read operations. `fpmsyncd` also flushes the pipeline when it gets full.
+In the original design, `fpmsyncd` maintains a variable `pipeline`. Each time `fpmsyncd` receives a route from `zebra`, it processes the route and puts it in the `pipeline`. And every time the `pipeline` receives a route, it flushes the route to `APPL_DB`. If the size of the incoming route exceeds the size of the `pipeline` itself, the `pipeline` performs multiple flushes to make sure the received route is written into `APPL_DB` completely. 
 
-That means, the flush frequency is decided by the data arrival frequency and the `pipeline` size, which is unnecessarily high and hurts performance.
+Each flush corresponds to a redis `SET` operation in `APPL_DB`, which triggers the `PUBLISH` event, then all subscribers get notified of the updates in `APPL_DB`, perform Redis `GET` operations to fetch the new route information from `APPL_DB`. 
+
+That means, a flush action of the `pipeline` not only leads to redis `SET`, but also `PUBISH` and `GET`, hence a high flush frequency would cause a high volumn of `REDIS` I/O traffic. However, the original `pipeline` flush frequency is decided by the data arrival frequency and the `pipeline` size, which is unnecessarily high and hurts performance.
 
 #### APPL_DB does redundant housekeeping
 When `orchagent` consumes `APPL_DB` with `pops()`, as Figure 2 shows, `pops` function not only reads from `route_table_set` to retrieve route prefixes, but also utilizes these prefixes to delete the entries in the temporary table `_ROUTE_TABLE` and write into the stable table `ROUTE_TABLE`, while at the same time transferring messages to `addToSync` procedure. The transformation from temporary tables to the stable tables causes much traffic but is actually not worth the time. 
 
 ### Slow Routes decode and kernel thread overhead in zebra
 
-`zebra` receives routes from `bgpd`. To understand the routing data sent by `bgpd`, it has to decode the received data with `zapi_route_decode` function, which consumes most computing resources, as the flame graph indicates. This function causes the slow start for `zebra`, since decode only happens at the very beginning of receiving new routes from `bgpd`.
+`zebra` receives routes from `bgpd`. To understand the routing data sent by `bgpd`, it has to decode the received data with `zapi_route_decode` function, which consumes the most computing resources, as the flame graph indicates. This function causes the slow start for `zebra`, since decode only happens at the very beginning of receiving new routes from `bgpd`.
 
 
-Although `zebra` employs two separate threads to send routes to both `Linux kernel` and `fpmsyncd`, both threads would return states that indicate whether the routing data are transfered successfully, then the main thread of `zebra` needs to talk with both threads. Hence when `zebra` is busy handling the installing states to kernel, the performance of that thread sending routes to `fpmsyncd` would be affected.
+Although the main thread of `zebra` only needs to send routes to `fpmsyncd` as the workload of sending routes to `Linux kernel` is offloaded to a child thread, the main thread still needs to process the returned results of the child thread which indicate whether data are successfully delivered to `kernel`. Hence when `zebra` is busy dealing with the `kernel` side, the performance of talking to `fpmsyncd` would be affected.
 
 <br>
 
@@ -186,11 +188,7 @@ Take `orchagent` for example, a single task of `orchagent` contains three sub-ta
 </figure>  
 
 #### Ring buffer for low-cost thread coordination
-
-`CODE of DATA STRUCTURE TO BE INSERTED`
-
-The producer thread and the consumer thread share the ring buffer.
-This ring buffer data structure not only temporarily stores data, but also serves the role of `mutex` while beats it in performance since the ring buffer is spared from the overhead from context switching.
+Since multiple threads are employed, we need a lock-free design with a ring buffer. This ring buffer data structure not only temporarily stores data, but also serves the role of `mutex` while beats it in performance since the ring buffer is spared from the overhead from context switching.
 ### Streamlining Redis I/O
 
 The optimization for `orchagent` and `syncd` can theoretically double the BGP loading performance, which makes Redis I/O performance now the bottleneck.
@@ -225,7 +223,7 @@ Since SAI doesn't work well on small piece of data, the slave thread should chec
 
 Routes will still be cached in `Consumer->m_toSync` rather than ring buffer if routeorch fails to push route to ASIC_DB. 
 
-We use a new C++ class `Consumer_pipeline`, which is derived from the original `Consumer` class in `RouteOrch`, which enables the usage of a slave thread.
+We use a new C++ class `Consumer_pipeline`, which is derived from the original `Consumer` class in `RouteOrch`, which enables the usage of a slave thread and utilizes the ring buffer.
 
 ```c++
 class Consumer_pipeline : public Consumer {
