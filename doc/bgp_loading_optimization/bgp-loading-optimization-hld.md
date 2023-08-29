@@ -1,12 +1,12 @@
 <!-- omit in toc -->
-# BGP Routes Loading Time Optimization for SONiC
+# BGP Loading Optimization for SONiC
 
 <!-- omit in toc -->
 ### Revision
 | Rev |     Date    |       Author       | Change Description                |
 |:---:|:-----------:|:------------------:|-----------------------------------|
-| 0.1 | Aug 16 2023 |   Yang FengSheng   | Initial Draft                     |
-| 0.2 | Aug 25 2023 |   Yijiao Qin       | Second Draft                      |
+| 0.1 | Aug 16 2023 |   FengSheng Yang   | Initial Draft                     |
+| 0.2 | Aug 29 2023 |   Yijiao Qin       | Supplement & Polish               |
 
 <!-- omit in toc -->
 ## Table of Content
@@ -14,10 +14,10 @@
 - [Definitions \& Abbreviations](#definitions--abbreviations)
 - [Bottleneck Analysis](#bottleneck-analysis)
   - [Problem overview](#problem-overview)
-  - [Serial orchagent](#serial-orchagent)
-  - [Serial syncd](#serial-syncd)
-  - [Unnecessary APPL\_DB I/O traffic](#unnecessary-appl_db-io-traffic)
-    - [fpmsyncd flushes on every data arrival](#fpmsyncd-flushes-on-every-data-arrival)
+  - [Single-threaded orchagent](#single-threaded-orchagent)
+  - [Single-threaded syncd](#single-threaded-syncd)
+  - [Redundant APPL\_DB I/O traffic](#redundant-appl_db-io-traffic)
+    - [fpmsyncd flushes on every incoming route](#fpmsyncd-flushes-on-every-incoming-route)
     - [APPL\_DB does redundant housekeeping](#appl_db-does-redundant-housekeeping)
   - [Slow Routes decode and kernel thread overhead in zebra](#slow-routes-decode-and-kernel-thread-overhead-in-zebra)
 - [Requirements](#requirements)
@@ -39,18 +39,17 @@
   - [Performance measurements when loading 500k routes](#performance-measurements-when-loading-500k-routes)
 
 ## Goal & Scope
-The goal of this project is to significantly increase the end-to-end BGP routes loading speed in SONiC.
+The goal of this project is to significantly increase the end-to-end BGP loading speed of SONiC
   - from 10k routes per sec to 25K routes per sec
   
 <figure align=center>
     <img src="images/performance.png" >
-    <figcaption>The Module Performance after optimization on Alibaba's platform when loading 500k BGP routes<figcaption>
+    <figcaption>Figure 1. The module performance on Alibaba's platform loading 500k routes after optimization <figcaption>
 </figure>  
 
-<br>
+
 
 The scope of this document only covers the performance optimization in `fpmsyncd`, `orchagent`, `syncd` and `zebra` and Redis I/O.
-
 We also observed performance bottleneck in `libsai`, but SAI/ASIC optimaztion is out of our scope since it varies by hardware.
 
 ## Definitions & Abbreviations
@@ -85,7 +84,7 @@ With the rapid growth of network demands, the number of BGP routes on routers ro
 
 <figure align="center">
     <img src="images/sonic-workflow.png" width="60%" height=auto>
-    <figcaption>Figure 1. SONiC BGP loading workflow</figcaption>
+    <figcaption>Figure 2. SONiC BGP loading workflow</figcaption>
 </figure>
 
 
@@ -105,9 +104,9 @@ table{
 
 The current bottleneck is 10.5K routes/s in `orchagent` and `syncd`  as shown in the table. 
 
-### Serial orchagent
+### Single-threaded orchagent
 
-Figure 2 explains how `orchagent` transfers routing data from `APPL_DB` to `ASIC_DB`.
+Figure 3 explains how `orchagent` transfers routing data from `APPL_DB` to `ASIC_DB`.
 
 `RouteOrch`, as a component of `orchagent`, has its `ConsumerStateTable` subscribed to `ROUTE_TABLE_CHANNEL` event. With this subscription, whenever `fpmsyncd` injects new routing data into `APPL_DB`, `orchagent` gets notified. Once notified, `orchagent` handles the following 3 tasks in serial.
 
@@ -126,11 +125,11 @@ The main performance bottleneck here lies in the linearity of the 3 tasks.
 
 <figure align=center>
     <img src="images/orchagent-workflow.png" width="60%" height=auto>
-    <figcaption>Figure 2. Orchagent workflow<figcaption>
+    <figcaption>Figure 3. Orchagent workflow<figcaption>
 </figure>  
 
 
-### Serial syncd
+### Single-threaded syncd
 
 `syncd` shares the similar problem (job linearity) with `orchagent`, the only difference is that `syncd` moves information from `ASIC_DB` to the hardware. 
 
@@ -138,22 +137,22 @@ The main performance bottleneck here lies in the linearity of the 3 tasks.
 
 <figure align=center>
     <img src="images/syncd-workflow.jpg" width="60%" height=auto>
-    <figcaption>Figure 3. Syncd workflow<figcaption>
+    <figcaption>Figure 4. Syncd workflow<figcaption>
 </figure>  
 
-### Unnecessary APPL_DB I/O traffic
+### Redundant APPL_DB I/O traffic
 
 There is much Redis I/O traffic during the BGP loading process, from which we find two sources of unnecessary traffic.
 
-#### fpmsyncd flushes on every data arrival
+#### fpmsyncd flushes on every incoming route
 In the original design, `fpmsyncd` maintains a variable `pipeline`. Each time `fpmsyncd` receives a route from `zebra`, it processes the route and puts it in the `pipeline`. Every time the `pipeline` receives a route, it flushes the route to `APPL_DB`. If the size of the incoming route exceeds the size of the `pipeline` itself, the `pipeline` performs multiple flushes to make sure the received routes are written into `APPL_DB` completely. 
 
 Each flush corresponds to a redis `SET` operation in `APPL_DB`, which triggers the `PUBLISH` event, then all subscribers get notified of the updates in `APPL_DB`, perform Redis `GET` operations to fetch the new route information from `APPL_DB`. 
 
-That means, a flush action of the `pipeline` not only leads to redis `SET`, but also `PUBISH` and `GET`, hence a high flush frequency would cause a high volumn of `REDIS` I/O traffic. However, the original `pipeline` flush frequency is decided by the data arrival frequency and the `pipeline` size, which is unnecessarily high and hurts performance.
+That means, a single `pipeline` flush not only leads to redis `SET`, but also `PUBISH` and `GET`, hence a high flush frequency would cause a huge volumn of `REDIS` I/O traffic. However, the original `pipeline` flush frequency is decided by the routes incoming frequency and the `pipeline` size, which is unnecessarily high and hurts performance.
 
 #### APPL_DB does redundant housekeeping
-When `orchagent` consumes `APPL_DB` with `pops()`, as Figure 2 shows, `pops` function not only reads from `route_table_set` to retrieve route prefixes, but also utilizes these prefixes to delete the entries in the temporary table `_ROUTE_TABLE` and write into the stable table `ROUTE_TABLE`, while at the same time transferring messages to `addToSync` procedure. The transformation from temporary tables to the stable tables causes much traffic but is actually not worth the time. 
+When `orchagent` consumes `APPL_DB` with `pops()`, as Figure 3 shows, `pops` function not only reads from `route_table_set` to retrieve route prefixes, but also utilizes these prefixes to delete the entries in the temporary table `_ROUTE_TABLE` and write into the stable table `ROUTE_TABLE`, while at the same time transferring messages to `addToSync` procedure. The transformation from temporary tables to the stable tables causes much traffic but is actually not worth the time. 
 
 ### Slow Routes decode and kernel thread overhead in zebra
 
@@ -167,7 +166,7 @@ The main thread of `zebra` not only needs to send routes to `fpmsyncd`, but also
 
 <figure align=center>
     <img src="images/zebra.jpg" width="60%" height=auto>
-    <figcaption>Figure 4. Zebra flame graph<figcaption>
+    <figcaption>Figure 5. Zebra flame graph<figcaption>
 </figure>  
 
 ## Requirements
@@ -175,19 +174,19 @@ The main thread of `zebra` not only needs to send routes to `fpmsyncd`, but also
 - All modifications should maintain the time sequence of route loading
 - All modules should support the warm restart operations after modified
 - With the optimization of this HLD implemented, the end-to-end BGP loading performance should be improved at least by 95%
-- The new optimization codes would be turn off by default. It could be turned on via configuration.
+- The new optimization codes would be turn off by default. It could be turned on via configuration
 
 
 ## High-Level Proposal
 
 ### Modification in orchagent/syncd to enable multi-threading
-Figure 5 below illustrates the high level architecture modification for `orchagent` and `syncd`, it compares the original architecture and the new pipeline architecture proposed by this HLD. The pipeline design changes the workflow of both `orchagent` and `syncd`, thus enabling them to employ multiple threads to do sub-tasks concurrently.
+Figure 6 below illustrates the high level architecture modification for `orchagent` and `syncd`, it compares the original architecture and the new pipeline architecture proposed by this HLD. The pipeline design changes the workflow of both `orchagent` and `syncd`, thus enabling them to employ multiple threads to do sub-tasks concurrently.
 
 Take `orchagent` for example, a single task of `orchagent` contains three sub-tasks `pops`, `addToSync` and `doTask`, and originally `orchagent` performs the three sub-tasks in serial. A new `pops` sub-task can only begin after the previous `doTask` is finished. The proposed design utilizes a separate thread to run `pops`, which decouples the `pops` sub-task from `addToSync` and `doTask`. As the figure shows, in the new pipeline architecture, a new `pops` sub-task begins immediately when it's ready, not having to wait for the previous `addToSync` and `doTask` to finish.
 
 <figure align=center>
     <img src="images/pipeline-timeline.png">
-    <figcaption>Figure 5. Pipeline architecture compared with the original serial architecture<figcaption>
+    <figcaption>Figure 6. Pipeline architecture compared with the original serial architecture<figcaption>
 </figure>  
 
 #### Ring buffer for low-cost thread coordination
@@ -204,7 +203,7 @@ Instead of flushing the `pipeline` on every data arrival and propose to use a fl
 
 <figure align=center>
     <img src="images/pipeline-mode.png" height=auto>
-    <figcaption>Figure 6. Proposed new BGP loading workflow<figcaption>
+    <figcaption>Figure 7. Proposed new BGP loading workflow<figcaption>
 </figure>  
 
 #### Disable the temporary table mechanism in APPL_DB
