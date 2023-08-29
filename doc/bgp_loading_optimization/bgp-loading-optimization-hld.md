@@ -1,5 +1,5 @@
 <!-- omit in toc -->
-# BGP Routes Loading Optimization for SONiC
+# BGP Routes Loading Time Optimization for SONiC
 
 <!-- omit in toc -->
 ### Revision
@@ -44,9 +44,10 @@ The goal of this project is to significantly increase the end-to-end BGP routes 
   
 <figure align=center>
     <img src="images/performance.png" >
-    <figcaption>Performance after optimization on Alibaba's platform when loading 500k BGP routes<figcaption>
+    <figcaption>The Module Performance after optimization on Alibaba's platform when loading 500k BGP routes<figcaption>
 </figure>  
 
+<br>
 
 The scope of this document only covers the performance optimization in `fpmsyncd`, `orchagent`, `syncd` and `zebra` and Redis I/O.
 
@@ -69,14 +70,14 @@ We also observed performance bottleneck in `libsai`, but SAI/ASIC optimaztion is
 ## Bottleneck Analysis
 
 ### Problem overview
-With the rapid growth of network demands, the number of BGP routes rockets up these years and the BGP loading time of SONiC inevitably increases. To make sure that SONiC could reliably offer fast service regardless of the explosive BGP routes growth, the current BGP loading time, which is estimated at tens of seconds, is definitely far from satisfatory. Speeding up the BGP loading process is essential for the scalability of SONiC, then we need to break down the whole loading process into several steps as shown in the figure below and find the performance bottleneck in BGP loading:
+With the rapid growth of network demands, the number of BGP routes on routers rockets up these years and the BGP loading time of SONiC inevitably increases. The current BGP loading time, which is estimated at tens of seconds, is definitely far from satisfatory for routing use cases. Speeding up the BGP loading process is essential for the scalability of SONiC. We need to break down the whole loading process into several steps as shown in the figure below and find the performance bottlenecks in BGP loading:
 
 
-1. `bgpd` parses the packets received by the socket, then processes the `bgp-update` message and notifies `zebra` of new prefixes and their corresponding next hops
-2. `zebra` decodes the message from `bgpd`, and delivers this routing message via `netlink` to `fpmsyncd` 
+1. `bgpd` parses the packets received by the socket, processes the `bgp-update` message and notifies `zebra` of new prefixes with their corresponding next hops
+2. `zebra` decodes the message from `bgpd`, and delivers this routing message in `netlink` message format to `fpmsyncd` 
 3. `fpmsyncd` processes this routing message and pushes it to `APPL_DB`
 4. `orchagent` has a subscription to `APPL_DB`, hence would consume the routing message newly pushed to `APPL_DB` 
-5. `orchagent` then injects its processed routing message into `ASIC_DB` with `sairedis` APIs 
+5. `orchagent` injects its processed routing message into `ASIC_DB` with `sairedis` APIs 
 6. `syncd` gets notified of the newly added routing message in `ASIC_DB` due to the subscription
 7. `syncd` processes the new routing message, then invokes `SAI` APIs to finally inject the new routing message into the hardware
 
@@ -94,21 +95,21 @@ table{
   margin:auto;
 }
 </style> -->
-| Module                   |  Speed(kilo-routes per second) |
-| ------------------------ | -------------------------------|
-| Zebra                    |  <center>17k/s                 |
-| Fpmsyncd                 |  <center>17k/s                 |
-| Orchagent                |  <center>10.5k/s               |
-| Syncd                    |  <center>10.5k/s               |
-| Total                    |  <center>10.5k/s               |
+| Module                   |  Speed(routes per second)    |
+| ------------------------ | -----------------------------|
+| Zebra                    |  <center>17K                 |
+| Fpmsyncd                 |  <center>17K                 |
+| Orchagent                |  <center>10.5K               |
+| Syncd                    |  <center>10.5K               |
+| Total                    |  <center>10.5K               |
 
-The current bottleneck is 10.5k/s in `orchagent` and `syncd`  as shown in the table. 
+The current bottleneck is 10.5K routes/s in `orchagent` and `syncd`  as shown in the table. 
 
 ### Serial orchagent
 
 Figure 2 explains how `orchagent` transfers routing data from `APPL_DB` to `ASIC_DB`.
 
-`RouteOrch`, as a component of `orchagent`, has its `ConsumerStateTable` subscribed to `ROUTE_TABLE_CHANNEL` event. With this subscription, whenever `fpmsyncd` injects new routing data into `APPL_DB`, `orchagent` gets notified. Once notified, `orchagent` do 3 tasks in serial.
+`RouteOrch`, as a component of `orchagent`, has its `ConsumerStateTable` subscribed to `ROUTE_TABLE_CHANNEL` event. With this subscription, whenever `fpmsyncd` injects new routing data into `APPL_DB`, `orchagent` gets notified. Once notified, `orchagent` handles the following 3 tasks in serial.
 
 1. use `pops` to fetch new routes from `APPL_DB`:
      - pop prefix from ROUTE_TABLE_SET 
@@ -145,7 +146,7 @@ The main performance bottleneck here lies in the linearity of the 3 tasks.
 There is much Redis I/O traffic during the BGP loading process, from which we find two sources of unnecessary traffic.
 
 #### fpmsyncd flushes on every data arrival
-In the original design, `fpmsyncd` maintains a variable `pipeline`. Each time `fpmsyncd` receives a route from `zebra`, it processes the route and puts it in the `pipeline`. And every time the `pipeline` receives a route, it flushes the route to `APPL_DB`. If the size of the incoming route exceeds the size of the `pipeline` itself, the `pipeline` performs multiple flushes to make sure the received route is written into `APPL_DB` completely. 
+In the original design, `fpmsyncd` maintains a variable `pipeline`. Each time `fpmsyncd` receives a route from `zebra`, it processes the route and puts it in the `pipeline`. Every time the `pipeline` receives a route, it flushes the route to `APPL_DB`. If the size of the incoming route exceeds the size of the `pipeline` itself, the `pipeline` performs multiple flushes to make sure the received routes are written into `APPL_DB` completely. 
 
 Each flush corresponds to a redis `SET` operation in `APPL_DB`, which triggers the `PUBLISH` event, then all subscribers get notified of the updates in `APPL_DB`, perform Redis `GET` operations to fetch the new route information from `APPL_DB`. 
 
@@ -159,7 +160,8 @@ When `orchagent` consumes `APPL_DB` with `pops()`, as Figure 2 shows, `pops` fun
 `zebra` receives routes from `bgpd`. To understand the routing data sent by `bgpd`, it has to decode the received data with `zapi_route_decode` function, which consumes the most computing resources, as the flame graph indicates. This function causes the slow start for `zebra`, since decode only happens at the very beginning of receiving new routes from `bgpd`.
 
 
-Although the main thread of `zebra` only needs to send routes to `fpmsyncd` as the workload of sending routes to `Linux kernel` is offloaded to a child thread, the main thread still needs to process the returned results of the child thread which indicate whether data are successfully delivered to `kernel`. Hence when `zebra` is busy dealing with the `kernel` side, the performance of talking to `fpmsyncd` would be affected.
+The main thread of `zebra` not only needs to send routes to `fpmsyncd`, but also needs to process the returned results of the child thread which indicate whether data are successfully delivered to `kernel`. Hence when `zebra` is busy dealing with the `kernel` side, the performance of talking to `fpmsyncd` would be affected.
+
 
 <br>
 
@@ -173,6 +175,7 @@ Although the main thread of `zebra` only needs to send routes to `fpmsyncd` as t
 - All modifications should maintain the time sequence of route loading
 - All modules should support the warm restart operations after modified
 - With the optimization of this HLD implemented, the end-to-end BGP loading performance should be improved at least by 95%
+- The new optimization codes would be turn off by default. It could be turned on via configuration.
 
 
 ## High-Level Proposal
@@ -180,7 +183,7 @@ Although the main thread of `zebra` only needs to send routes to `fpmsyncd` as t
 ### Modification in orchagent/syncd to enable multi-threading
 Figure 5 below illustrates the high level architecture modification for `orchagent` and `syncd`, it compares the original architecture and the new pipeline architecture proposed by this HLD. The pipeline design changes the workflow of both `orchagent` and `syncd`, thus enabling them to employ multiple threads to do sub-tasks concurrently.
 
-Take `orchagent` for example, a single task of `orchagent` contains three sub-tasks `pops`, `addToSync` and `doTask`, and originally `orchagent` performs the three sub-tasks in serial. A new `pops` sub-task can only begin after the previous `doTask` is finished, however that is not necessary, so the new design utilizes a separate thread to run `pops`, which decouples the `pops` sub-task from `addToSync` and `doTask`. As the figure shows, in the new pipeline architecture, a new `pops` sub-task begins immediately when it's ready, not having to wait for the previous `addToSync` and `doTask` to finish.
+Take `orchagent` for example, a single task of `orchagent` contains three sub-tasks `pops`, `addToSync` and `doTask`, and originally `orchagent` performs the three sub-tasks in serial. A new `pops` sub-task can only begin after the previous `doTask` is finished. The proposed design utilizes a separate thread to run `pops`, which decouples the `pops` sub-task from `addToSync` and `doTask`. As the figure shows, in the new pipeline architecture, a new `pops` sub-task begins immediately when it's ready, not having to wait for the previous `addToSync` and `doTask` to finish.
 
 <figure align=center>
     <img src="images/pipeline-timeline.png">
@@ -188,10 +191,12 @@ Take `orchagent` for example, a single task of `orchagent` contains three sub-ta
 </figure>  
 
 #### Ring buffer for low-cost thread coordination
-Since multiple threads are employed, we need a lock-free design with a ring buffer. This ring buffer data structure not only temporarily stores data, but also serves the role of `mutex` while beats it in performance since the ring buffer is spared from the overhead from context switching.
+Since multiple threads are employed, we take a lock-free design by using a ring buffer as an asynchronous communication channel.
+
+
 ### Streamlining Redis I/O
 
-The optimization for `orchagent` and `syncd` can theoretically double the BGP loading performance, which makes Redis I/O performance now the bottleneck.
+The optimization for `orchagent` and `syncd` can theoretically double the BGP loading performance, which makes Redis I/O performance become a new bottleneck.
 
 #### Lower frequency of the fpmsyncd flush & APPL_DB publish
 
@@ -268,7 +273,7 @@ As mentioned, <b>a timer thread</b> is added to control the flush behavior of `f
 
 We define a variable `FLUSH_INTERVAL` to represent the flush frequency, although we expect a lower frequency, it should make sure that data in the pipeline don't wait for too long to enter `APPL_DB`.
 
-Since `fpmsyncd` also flushes the pipeline when it's full, `REDIS_PIPELINE_SIZE` also needs tuning. `10000` to `15000` is tested to be a good range in our use cases. 
+Since `fpmsyncd` flushes the pipeline when it's full, `REDIS_PIPELINE_SIZE` needs to be tuned. `10000` to `15000` is tested to be a good range in our use cases. 
 
 ### APPL_DB
 <!-- omit in toc -->
@@ -325,7 +330,7 @@ This change doubles the performance of `Table->pops()` and hence leads to routin
 TBD
 
 ## WarmRestart scenario
-This proposal also consider the compatibility with SONiC `WarmRestart` feature. For example, when a user updates the config, a warm restart may be needed for the config update to be reflected. Then SONiC's main thread would call `dumpPendingTasks()` function to save the current system states and restore the states after the warm restart. Since this HLD introduces a new thread and a new structure `ring buffer` which stores some data, then we have to ensure that the data in `ring buffer` all gets processed before warm restart. Also, during warm start, the main thread would modify the variable `m_toSync`, which the new thread also have access to, so we should block the new thread during warm restart to avoid conflict.
+This proposal considers the compatibility with SONiC `WarmRestart` feature. For example, when a user updates the config, a warm restart may be needed for the config update to be reflected. SONiC's main thread would call `dumpPendingTasks()` function to save the current system states and restore the states after the warm restart. Since this HLD introduces a new thread and a new structure `ring buffer` which stores some data, then we have to ensure that the data in `ring buffer` all gets processed before warm restart. During warm start, the main thread would modify the variable `m_toSync`, which the new thread also have access to. Therefore we should block the new thread during warm restart to avoid conflict.
 
 Take orchagent for example, we need to make sure ring buffer is empty and the new thread is in idle before we call ```dumpPendingTasks()```. 
 
