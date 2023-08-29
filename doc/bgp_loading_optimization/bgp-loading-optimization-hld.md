@@ -43,7 +43,7 @@ The goal of this project is to significantly increase the end-to-end BGP routes 
   - from 10k routes per sec to 25K routes per sec
   
 <figure align=center>
-    <img src="img/performance.png" >
+    <img src="images/performance.png" >
     <figcaption>Performance after optimization on Alibaba's platform when loading 500k BGP routes<figcaption>
 </figure>  
 
@@ -83,7 +83,7 @@ With the rapid growth of network demands, the number of BGP routes rockets up th
 **NOTE**: This is not the [whole workflow for routing](https://github.com/SONiC-net/SONiC/wiki/Architecture#routing-state-interactions), we ignore the Linux kernel part since we currently focus only on the SONiC part.
 
 <figure align="center">
-    <img src="img/sonic-workflow.png" width="60%" height=auto>
+    <img src="images/sonic-workflow.png" width="60%" height=auto>
     <figcaption>Figure 1. SONiC BGP loading workflow</figcaption>
 </figure>
 
@@ -124,7 +124,7 @@ The main performance bottleneck here lies in the linearity of the 3 tasks.
 <br>
 
 <figure align=center>
-    <img src="img/orchagent-workflow.png" width="60%" height=auto>
+    <img src="images/orchagent-workflow.png" width="60%" height=auto>
     <figcaption>Figure 2. Orchagent workflow<figcaption>
 </figure>  
 
@@ -136,7 +136,7 @@ The main performance bottleneck here lies in the linearity of the 3 tasks.
 <br>
 
 <figure align=center>
-    <img src="img/syncd-workflow.jpg" width="60%" height=auto>
+    <img src="images/syncd-workflow.jpg" width="60%" height=auto>
     <figcaption>Figure 3. Syncd workflow<figcaption>
 </figure>  
 
@@ -164,7 +164,7 @@ Although the main thread of `zebra` only needs to send routes to `fpmsyncd` as t
 <br>
 
 <figure align=center>
-    <img src="img/zebra.jpg" width="60%" height=auto>
+    <img src="images/zebra.jpg" width="60%" height=auto>
     <figcaption>Figure 4. Zebra flame graph<figcaption>
 </figure>  
 
@@ -183,7 +183,7 @@ Figure 5 below illustrates the high level architecture modification for `orchage
 Take `orchagent` for example, a single task of `orchagent` contains three sub-tasks `pops`, `addToSync` and `doTask`, and originally `orchagent` performs the three sub-tasks in serial. A new `pops` sub-task can only begin after the previous `doTask` is finished, however that is not necessary, so the new design utilizes a separate thread to run `pops`, which decouples the `pops` sub-task from `addToSync` and `doTask`. As the figure shows, in the new pipeline architecture, a new `pops` sub-task begins immediately when it's ready, not having to wait for the previous `addToSync` and `doTask` to finish.
 
 <figure align=center>
-    <img src="img/pipeline-timeline.png">
+    <img src="images/pipeline-timeline.png">
     <figcaption>Figure 5. Pipeline architecture compared with the original serial architecture<figcaption>
 </figure>  
 
@@ -198,7 +198,7 @@ The optimization for `orchagent` and `syncd` can theoretically double the BGP lo
 Instead of flushing the `pipeline` on every data arrival and propose to use a flush timer to determine the flush frequency as illustrated below.
 
 <figure align=center>
-    <img src="img/pipeline-mode.png" height=auto>
+    <img src="images/pipeline-mode.png" height=auto>
     <figcaption>Figure 6. Proposed new BGP loading workflow<figcaption>
 </figure>  
 
