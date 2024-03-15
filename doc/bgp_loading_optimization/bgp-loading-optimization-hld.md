@@ -10,6 +10,7 @@
 | 0.2 | Aug 29 2023 |   Yijiao Qin       | Second Draft                      |
 | 0.3 | Sep  5 2023 |   Nikhil Kelapure  | Supplement of Async SAI Part      |
 | 1.0 | Feb  1 2024 |   Yijiao Qin       | Update test strategy              |
+| 1.1 | Mar  4 2024 |   Hua Liu          | Improve Orchagent with ZMQ        |
 
 <!-- omit in toc -->
 ## Table of Contents
@@ -18,27 +19,23 @@
   - [Similar works](#similar-works)
 - [Definitions \& Abbreviations](#definitions--abbreviations)
 - [Overview](#overview)
-  - [Orchagent consumer execute workflow is single-threaded](#orchagent-consumer-execute-workflow-is-single-threaded)
+  - [Orchagent consumer workflow is single-threaded](#orchagent-consumer-workflow-is-single-threaded)
   - [Syncd is too strictly locked](#syncd-is-too-strictly-locked)
   - [Redundant APPL\_DB I/O traffic](#redundant-appl_db-io-traffic)
-    - [producerstatetable publishes every command and fpmsyncd flushes on every select event](#producerstatetable-publishes-every-command-and-fpmsyncd-flushes-on-every-select-event)
+    - [fpmsyncd flushes on every incoming route](#fpmsyncd-flushes-on-every-incoming-route)
     - [APPL\_DB does redundant housekeeping](#appl_db-does-redundant-housekeeping)
   - [Slow Routes decode and kernel thread overhead in zebra](#slow-routes-decode-and-kernel-thread-overhead-in-zebra)
   - [Synchronous sairedis API usage](#synchronous-sairedis-api-usage)
 - [Requirements](#requirements)
 - [High-Level Proposal](#high-level-proposal)
-  - [1. Reduce Redis I/O traffic between Fpmsyncd and Orchagent](#1-reduce-redis-io-traffic-between-fpmsyncd-and-orchagent)
-    - [1.1 Remove _PUBLISH_  in the lua script](#11-remove-publish--in-the-lua-script)
-    - [1.2 Reduce pipeline flush frequency](#12-reduce-pipeline-flush-frequency)
-    - [1.3 Discard the state table with prefix \_](#13-discard-the-state-table-with-prefix-_)
+  - [1. Improve I/O performance between Fpmsyncd and Orchagent with ZMQ](#1-improve-io-performance-between-fpmsyncd-and-orchagent-with-zmq)
   - [2. Add an assistant thread to the monolithic Orchagent/Syncd main event loop workflow](#2-add-an-assistant-thread-to-the-monolithic-orchagentsyncd-main-event-loop-workflow)
   - [3. Asynchronous sairedis API usage](#3-asynchronous-sairedis-api-usage)
     - [New ResponseThread in OA](#new-responsethread-in-oa)
 - [Low-Level Implementation](#low-level-implementation)
   - [Fpmsyncd](#fpmsyncd)
-  - [Lua scripts](#lua-scripts)
-  - [Multi-threaded orchagent with a singleton ring buffer](#multi-threaded-orchagent-with-a-singleton-ring-buffer)
-  - [Syncd \[similar optimization to orchagent\]](#syncd-similar-optimization-to-orchagent)
+  - [Orchagent](#orchagent)
+  - [Syncd](#syncd)
   - [Asynchronous sairedis API usage and new  ResponseThread in orchagent](#asynchronous-sairedis-api-usage-and-new--responsethread-in-orchagent)
 - [WarmRestart scenario](#warmrestart-scenario)
 - [Testing and measurements](#testing-and-measurements)
@@ -62,7 +59,7 @@ table{
 | Module                   |  Original Speed(routes/s)    | Optimized Speed (routes/s) |
 | ------------------------ | -----------------------------| -----------------------------|
 | Zebra / Fpmsyncd         |  <center>17K                 | <center>25.4K                 |
-| Orchagent                |  <center>10.5K               | <center>23.5K                 |
+| Orchagent                |  <center>10.5K               | <center>30.7K                 |
 | Syncd                    |  <center>10.5K               | <center>19.6K                 |
 
 This HLD only covers the optimization in `fpmsyncd`, `orchagent`, `syncd` and `zebra` and Redis I/O. SAI/ASIC optimaztion is out of the scope.
@@ -82,6 +79,7 @@ This is an excellent achievement and we would kudo JNPR team to raise this racin
 | SYNCD                    | ASIC synchronization service            |
 | FPM                      | Forwarding Plane Manager                |
 | SAI                      | Switch Abstraction Interface            |
+| ZMQ                      | ZeroMQ                                  |
 
 ## Overview
 
@@ -179,35 +177,16 @@ Once `orchagent` `doTask` writes data to ASIC_DB, it waits for response from `sy
 
 ## High-Level Proposal
 
-### 1. Reduce Redis I/O traffic between Fpmsyncd and Orchagent
+### 1. Improve I/O performance between Fpmsyncd and Orchagent with ZMQ
 
-#### 1.1 Remove _PUBLISH_  in the lua script
->
-> Fpmsyncd uses _ProducerStateTable_ to send data out and Orchagent uses _ConsumerStateTable_ to read data in.  
-While the producer has APIs associated with lua scripts for Redis operations, each script ends with a _PUBLISH_ command to notify the downstream consumers.
+Orchagent subscribe data with redis based ConsumerStateTable, sonic-swss-common has ZMQ based ZmqProducerStateTable/ZmqConsumerStateTable, here are compare with redis based tables:
+1. 200+ times faster than redis based table, ZMQ table can transfer 800K route entry per-second, redis table can only transfer 3.7K route entry per-second.
+2. Fully compatible with ProducerStateTable/ConsumerStateTable.
+3. Asynchronous update redis DB with background thread.
 
-Since we have employed Redis pipeline to queue commands up and flush them in a batch, it's unnecessary to _PUBLISH_ for each command. We can attach a _PUBLISH_ at the end of the command queue when the pipeline flushes, then the whole batch could share this single _PUBLISH_ and we reduce traffic for O(n) _PUBLISH_ to O(1).
 <figure align=center>
-    <img src="images/BatchPub.png" height=auto>
-</figure>  
-
-#### 1.2 Reduce pipeline flush frequency
-
-> Redis pipeline flushes itself when it's full, otherwise it temporarily holds the redis commands in its buffer.  
-The commands would not get stuck in the pipeline since Fpmsyncd would also flush the pipeline, and this behavior is event-triggered with _select_ method.
-
-Firstly, we could increase pipeline buffer size from the default 125 to 10k, which would decrease the frequency of the pipeline flushing itself.  
-Secondly, we could skip Fpmsyncd flushes when it's not that long since the last flush and set a _flush timeout_ to determine the threshold.  
-To avoid commands lingering in the pipeline due to skip, we change the _select timeout_ of Fpmsyncd from _infinity_ to _flush timeout_ after a successful skip to make sure that these commands are eventually flushed. And after flushing the lingered commands, the _select timeout_ of Fpmsyncd would change back to _infinity_ again.  
-To make sure that consumers are able to get all the modified data when the number of _PUBLISH_ is equal to the number of flushes, while still keep the consumer pop size as 125, consumer needs to do multiple pops for a single _PUBLISH_.  
-If there is a batch of fewer than 10 routes coming to the pipeline, they would be directly flushed, in case they are important routes.
-
-#### 1.3 Discard the state table with prefix _
->
-> Pipeline flushes data into the state table and use the data structure _KeySet_ to mark modified keys.  
-When Orchagent is notified of new data coming, it recognized modified keys by _KeySet_, then transfers data from the state table to the stable table, then deletes the state table.
-
-We propose to discard state tables, directly flush data to stable tables, while keep the data structure _KeySet_ to track modified keys.
+    <img src="images/zmq-diagram.png" height=auto>
+</figure>
 
 ### 2. Add an assistant thread to the monolithic Orchagent/Syncd main event loop workflow
 
@@ -255,152 +234,89 @@ A new `ResponseThread` is used in `orchagent` to process the response when its r
 
 ### Fpmsyncd
 
-Redis Pipeline would flush itself when it's full, to save TCP traffic, we choose _10000_ despite the default 125 as the pipeline size.
+Change from ProducerStateTable to ZmqProducerStateTable:
 
 ```c++
-#define FPMSYNCD_PIPELINE_SIZE 10000
-#define FLUSH_TIMEOUT 200
-#define BLOCKING -1
 
-RedisPipeline pipeline(&db, FPMSYNCD_PIPELINE_SIZE);
-
-/**
- * @brief fpmsyncd's flush logic
- * 
- * Although ppl flushes itself when it's full, fpmsyncd also flushes it in some cases.
- * This function decides fpmsyncd's flush logic and returns whether it's skipped.
- * 
- * @param pipeline Pointer to the pipeline to be flushed.
- * @param interval The expected interval between each flush.
- * @param force if true, flush is guaranted
- * @return true only if this flush is skipped when pipeline is non-empty
- */
-bool flushPPLine(RedisPipeline* pipeline, int interval, bool forced=false);
-
-int select_timeout = BLOCKING;
-while (true)
+class RouteSync : public NetMsg
 {
-    Selectable *temps;
-    auto ret = s.select(&temps, select_timeout);
-    ....
-    if (select_timeout == FLUSH_TIMEOUT && ret==Select::TIMEOUT) {
-        flushPPLine(&pipeline, FLUSH_TIMEOUT, true);
-        select_timeout = BLOCKING;
-    } else if (flushPPLine(&pipeline, FLUSH_TIMEOUT)) {
-        select_timeout = FLUSH_TIMEOUT;
+...
+private:
+    /* regular route table */
+    unique_ptr<ProducerStateTable> m_routeTable;
+    /* label route table */
+    unique_ptr<ProducerStateTable> m_label_routeTable;
+...
+
+RouteSync::RouteSync(RedisPipeline *pipeline, ZmqClient *zmqClient) :
+    m_vnet_routeTable(pipeline, APP_VNET_RT_TABLE_NAME, true),
+    m_vnet_tunnelTable(pipeline, APP_VNET_RT_TUNNEL_TABLE_NAME, true),
+    m_nl_sock(NULL), m_link_cache(NULL)
+{
+    if (zmqClient != nullptr) {
+        m_routeTable = unique_ptr<ProducerStateTable>(new ZmqProducerStateTable(pipeline, APP_ROUTE_TABLE_NAME, *zmqClient, true));
+        m_label_routeTable = unique_ptr<ProducerStateTable>(new ZmqProducerStateTable(pipeline, APP_LABEL_ROUTE_TABLE_NAME, *zmqClient, true));
     }
-}
-
-```
-
-### Lua scripts
-<!-- omit in toc -->
-#### sonic-swss-common/common/producerstatetable.cpp
-
-Take _luaSet_ for example
-
-```c++
-local added = redis.call('SADD', KEYS[2], ARGV[2])  
-for i = 0, #KEYS - 3 do  
-    redis.call('HSET', KEYS[3 + i], ARGV[3 + i * 2], ARGV[4 + i * 2])  
-end  
-if added > 0 then  
-    redis.call('PUBLISH', KEYS[1], ARGV[1])  
-end
-```
-
-changed to
-
-```lua
-local added = redis.call('SADD', KEYS[2], ARGV[2])
-for i = 0, #KEYS - 3 do
-    redis.call('HSET', KEYS[3 + i], ARGV[3 + i * 2], ARGV[4 + i * 2])
-end
-```
-
-<!-- omit in toc -->
-#### sonic-swss-common/common/consumer_state_table_pops.lua
-
-```lua
-redis.replicate_commands()
-local ret = {}
-local tablename = KEYS[2]
-local keys = redis.call('SPOP', KEYS[1], ARGV[1])
-
-if keys and #keys > 0 then
-    local n = #keys
-    for i = 1, n do
-        local key = keys[i]
-        local fieldvalues = redis.call('HGETALL', tablename..key)
-        table.insert(ret, {key, fieldvalues})
-        end
-    end
-end
-
-return ret
-```
-
-
-### Multi-threaded orchagent with a singleton ring buffer
-
-OrchDaemon initializes the global ring buffer, _gRingBuffer_ and passes its pointer to both _Orch_ and _Consumer_ as a Class static variable, so that the ring is unique in Orchagent.
-
-```c++
-class Consumer2;
-typedef std::pair<Consumer2*, swss::KeyOpFieldsValuesTuple> EntryType;
-typedef RingBuffer<EntryType> OrchRing;
-OrchRing* OrchDaemon::gRingBuffer = OrchRing::Get();
-
-bool OrchDaemon::init()
-{
-    ...
-    Consumer2::gRingBuffer = gRingBuffer;
-    Orch::gRingBuffer = gRingBuffer;
-}
-```
-
-- When OrchDaemon starts, it kicks off a new thread _rb_thread_.
-- The main thread still calls Consumer _execute()_ method.
-- But _execute()_ now only includes _pops(entries)_ and _addToRing(entries)_, which means reading data from Redis APP_DB and inserting them into the ring buffer.
-- The ring buffer thread `rb_thread` executes _popRingBuffer()_ method, which keeps poping the ring and calls _addToSync(entries)_ and _drain()_ for entries popped from the ring.
-
-We implemented a C++ class `Consumer2`, derived from `Consumer`, inheriting all its functions but overrides _execute()_.
-
-```c++
-void Consumer2::execute()
-{
-    std::deque<KeyOpFieldsValuesTuple> entries;
-    while (true) {
-        getConsumerTable()->pops(entries);
-        if (entries.size() == 0)
-            break;
-        addToRing(entries);
+    else {
+        m_routeTable = make_unique<ProducerStateTable>(pipeline, APP_ROUTE_TABLE_NAME, true);
+        m_label_routeTable = make_unique<ProducerStateTable>(pipeline, APP_LABEL_ROUTE_TABLE_NAME, true);
     }
+    
+...
 }
+```
 
-void OrchDaemon::popRingBuffer()
+### Orchagent
+
+Change RouteOrch inherit from ZmqOrch:
+
+```c++
+class RouteOrch : public ZmqOrch, public Subject
 {
-    ...
-    Consumer2* consumer2 = gRingBuffer->HeadEntry().first;
-    std::deque<swss::KeyOpFieldsValuesTuple> entries;
-    EntryType entry;
-    /* Entries in the buffer may belong to different consumers, hence stop when the next entry belongs to other consumers. */
-    while (gRingBuffer->IsEmpty() == false && gRingBuffer->HeadEntry().first == consumer2 && gRingBuffer->pop(entry))
+public:
+    RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch, swss::ZmqServer *zmqServer = nullptr);
+
+...
+```
+
+- ZmqOrch class inherit from Orch class.
+- When zmqServer is not nullptr, ZmqOrch will create consumer with ZmqConsumerStateTable
+- ZmqConsumerStateTable will create background thread for async APPL_DB update
+
+ZmqOrch and ZmqConsumer provide ZMQ support:
+```c++
+class ZmqOrch : public Orch
+{
+public:
+    ZmqOrch(swss::DBConnector *db, const std::vector<std::string> &tableNames, swss::ZmqServer *zmqServer);
+    ZmqOrch(swss::DBConnector *db, const std::vector<table_name_with_pri_t> &tableNames_with_pri, swss::ZmqServer *zmqServer);
+
+    virtual void doTask(ConsumerBase &consumer) { };
+    void doTask(Consumer &consumer) override;
+
+private:
+    void addConsumer(swss::DBConnector *db, std::string tableName, int pri, swss::ZmqServer *zmqServer);
+};
+
+class ZmqConsumer : public ConsumerBase {
+public:
+    ZmqConsumer(swss::ZmqConsumerStateTable *select, Orch *orch, const std::string &name)
+        : ConsumerBase(select, orch, name)
     {
-        entries.emplace_back(entry.second);
     }
-    consumer2->addToSync(entries);
-    consumer2->drain();
-    ...
-}
 
-void OrchDaemon::start()
-{
-    rb_thread = std::thread(&OrchDaemon::popRingBuffer, this);
-}
+    swss::TableBase *getConsumerTable() const override
+    {
+        // ZmqConsumerStateTable is a subclass of TableBase
+        return static_cast<swss::ZmqConsumerStateTable *>(getSelectable());
+    }
+
+    void execute() override;
+    void drain() override;
+};
 ```
 
-### Syncd [similar optimization to orchagent]
+### Syncd
 
 Similar case for syncd with orchagent. In our proposal, consumer.pop and processSingleEvent(kco) is decoupled.
 
